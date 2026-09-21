@@ -1,0 +1,53 @@
+[project]
+name = "continual"
+version = "0.1.0"
+description = "Trunk — OTel ingest, episode store, replay harness"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "psycopg[binary,pool]>=3.2",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "python-dotenv>=1.0",
+    "alembic>=1.14",
+    "sqlalchemy>=2.0",
+    "boto3>=1.34",
+    # OTLP ingest: the protobuf definitions for the OTLP trace service. We decode
+    # exporter payloads with these rather than hand-rolling the wire format.
+    "opentelemetry-proto>=1.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.27",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/continual"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+src = ["src", "tests"]
+target-version = "py311"
+line-length = 100
+extend-exclude = ["db/alembic/versions"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "SIM", "C4"]
+ignore = [
+    # Nested `async with pool.connection() ... cursor()` is the deliberate DB idiom
+    # across every store; flattening it hurts more than it helps.
+    "SIM117",
+    "SIM105",
+]
