@@ -43,9 +43,9 @@ Named explicitly so they don't leak into the build:
 
 ## 2. Decisions
 
-### 2.1 Ingest path — OTLP front door, SDK for fidelity
+### 2.1 Ingest path — OTLP front door, SDK for fidelity, batch import for backfill
 
-Customers reach the trunk two ways, and the difference is load-bearing.
+Customers reach the trunk three ways, and the difference is load-bearing.
 
 **(A) OTLP endpoint.** The trunk exposes an OTLP/HTTP receiver. A customer
 points their existing OpenTelemetry exporter at it with one environment
@@ -54,16 +54,24 @@ instrumentation they already run.
 
 **(B) Continual SDK.** A thin wrapper over the customer's LLM client that emits
 spans with content, tool schemas, tool results, model parameters and a session
-ID guaranteed present. Exports over OTLP to the same endpoint.
+ID guaranteed present. Exports over OTLP to the same endpoint. Specified in
+detail in §2.6.
 
-Both paths land in the same receiver. The difference is what arrives.
+**(C) Batch import.** A one-time CLI load of a design partner's *existing*
+observability export (LangSmith, Braintrust, Arize) into the same raw-span
+store, for a partner who has history worth backfilling before either (A) or
+(B) has accumulated any. Specified in detail in §2.7.
 
-**Why both.** OpenTelemetry's GenAI semantic conventions make message content
-opt-in — `gen_ai.input.messages` and `gen_ai.output.messages` are gated behind
-an experimental opt-in flag, and most vendor instrumentation truncates or omits
-them by default, because prompts are large and contain PII. A default OTLP
-trace therefore carries model name, token counts and latency, but not the
-prompt.
+All three land in the same place — normalized `CanonicalSpan` records passing
+through validate → redact → the raw store (§2.4). The difference is what
+arrives, and by what path.
+
+**Why (A) and (B) both.** OpenTelemetry's GenAI semantic conventions make
+message content opt-in — `gen_ai.input.messages` and `gen_ai.output.messages`
+are gated behind an experimental opt-in flag, and most vendor instrumentation
+truncates or omits them by default, because prompts are large and contain PII.
+A default OTLP trace therefore carries model name, token counts and latency,
+but not the prompt.
 
 That is enough to *count* failures. It is not enough to *replay* one. Replay
 requires reconstructing the exact model input; an episode missing its tool
@@ -75,14 +83,11 @@ fidelity is not optional. But requiring the SDK before any value is delivered
 contradicts `PLAN.md` Stage 2's "delivers value in week one." Hence both, with
 the gap made explicit rather than hidden — see §2.2.
 
-**Sequencing.** OTLP receiver first. The SDK is specified against what a real
-customer's OTLP traffic turns out to be missing, so it is not in Stage 1's
-critical path and is not specified in detail here.
-
-**Note for the first design partner.** If they already run LangSmith,
-Braintrust or Arize, those stores may already hold full content. A batch
-importer reading their export is likely a faster path to the first replayable
-episodes than the SDK. Ask before building.
+**Sequencing.** OTLP receiver first — it is Stage 1's critical path (§4,
+Task Sequence). The SDK is specified against what a real customer's OTLP
+traffic turns out to be missing (§2.6), so it ships as a Stage 1 *exit*
+deliverable, not a Stage 1 blocker. Batch import (§2.7) is conditional on a
+specific design partner's existing tooling and is built per-vendor, on demand.
 
 ### 2.2 Replay tier — a computed property of every episode
 
@@ -177,6 +182,93 @@ customer-side (in the SDK/collector, strongest posture) or server-side (easier
 to fix, we hold raw PII briefly). The hook's position is identical either way,
 so the decision is deferrable without cost.
 
+### 2.6 SDK — guaranteeing replay-required fields by construction
+
+§2.1(B)'s summary, expanded. The SDK exists to close exactly the gap §2.1
+names: default OTel capture is enough to count failures, not to replay them.
+Its whole job is that every span it emits already satisfies every field §5.3
+requires for `replayable` — there is no `observe_only` case for a call the SDK
+wrapped, by construction.
+
+**Shape.** A thin wrapper around the customer's LLM client (OpenAI-shaped
+first, since that interface is what most agent frameworks proxy), plus a
+session context manager. It does not reimplement transport: it configures a
+standard `opentelemetry-sdk` `TracerProvider` with an OTLP/HTTP exporter
+pointed at the same receiver endpoint as §2.1(A), so no new server-side code
+is needed to accept it — it is a better-instrumented OTLP client, not a
+second protocol.
+
+**API surface, minimal:**
+
+- `continual_sdk.init(endpoint=None, tenant=None)` — reads
+  `OTEL_EXPORTER_OTLP_ENDPOINT` / a tenant token env var if not passed
+  explicitly, mirroring §2.1(A)'s zero-config convention.
+- `continual_sdk.session(session_id=None)` — a context manager. Every span
+  emitted inside it carries `continual.session_id`, which is first in the
+  trunk's own resolution precedence (§5.2) — so an SDK-wrapped call's session
+  is never inferred, only ever explicit or generated once per conversation.
+- `continual_sdk.wrap(client)` — returns a wrapped client. Each traced call
+  emits one span carrying, unconditionally: `gen_ai.request.model`,
+  `gen_ai.input.messages` and `gen_ai.output.messages` in full (no truncation
+  — §5.3 treats truncation as absence), `gen_ai.request.temperature` /
+  `top_p`, the tool definitions as presented, and tool call results verbatim.
+  This list is exactly the §5.3 table; the SDK is defined as the thing that
+  always supplies it.
+
+**Language and sequencing.** Python first — it is what the exit-criteria list
+in the implementation plan names. TypeScript is deferred until a design
+partner's stack needs it; nothing in this design is Python-specific enough to
+make that port hard later.
+
+**Why it still ships after the trunk, not with it.** The SDK's own
+requirements — which fields real instrumentation omits, in what proportion,
+across which frameworks — are read off the `missing_fields` distribution
+§2.2 makes every `observe_only` episode record. Building it before that data
+exists means guessing at a spec instead of reading one off real traffic. That
+argument is unchanged from §2.1; this section only fixes what gets built once
+the data says to build it.
+
+### 2.7 Batch import — one-time historical backfill
+
+§2.1(C)'s summary, expanded. Some design partners already run an
+observability tool — LangSmith, Braintrust, Arize — that has been capturing
+full request/response content for months before Continual exists for them.
+Waiting on OTLP traffic (§2.1(A)) or an SDK rollout (§2.6) to accumulate
+replayable episodes throws that history away for no reason; it can be read
+once and imported.
+
+**Mechanism.** A CLI reads a vendor's export file and a **per-vendor
+adapter** maps its records to `CanonicalSpan` — the exact same normalized
+shape `normalize_otlp_json` produces from OTLP (Task 4). The imported batch
+is then pushed through the identical validate → redact → raw-store write
+path a live OTLP delivery uses (§2.1, §2.4). There is no separate storage
+format, no separate materializer, and no separate replay-tier logic for
+imported data: it becomes ordinary raw spans, and everything downstream
+(assembly, tiering, the Stage 1 gate) cannot tell the difference. This is the
+same principle §2.3 already commits to for late spans — the trunk has one
+path from "spans exist" to "episode," and import is just another producer of
+spans, not a parallel pipeline.
+
+**Adapter interface:** `parse_export(path: Path) -> Iterator[CanonicalSpan]`,
+one function per vendor. Same shape as the Stage 2 seams in §7 — a narrow,
+swappable interface, because the number of vendors worth supporting is
+unknown and each is a small, isolated addition.
+
+**Provenance.** Imported spans carry
+`continual.import.source = "batch:<vendor>"` in `resource_attributes`, so a
+materialized episode — and the spot-check CLI (§6) — can always tell backfill
+from live traffic. This matters because a backfilled episode's `replayable`
+tier depends entirely on how complete the *source vendor's* capture was, not
+on anything Continual controls; conflating the two in a spot-check would
+misattribute a vendor's gaps to the trunk's own ingest.
+
+**Scope, deliberately narrow.** This section specifies the harness — the CLI,
+the shared write path, the adapter interface — as a generic, Stage-1-adjacent
+capability. It does **not** pre-build adapters for every vendor. Per §2.1(C),
+each vendor adapter is built for a specific design partner's actual export,
+on demand — the same "ask before building" discipline as before, now aimed at
+a defined seam instead of an open-ended idea.
+
 ---
 
 ## 3. Inherited conventions
@@ -214,20 +306,25 @@ shape. No code is copied; the idioms are.
 ## 4. Architecture
 
 ```
-  customer agent
-       │
+  customer agent          design partner's
+       │                  existing observability store
        ├── (A) existing OTel exporter ──┐   one env var, zero code
        │                                 │
-       └── (B) continual SDK ────────────┤   guaranteed content + session_id
-                                         │
-                                         ▼
+       ├── (B) continual SDK ────────────┤   guaranteed content + session_id
+       │                                 │
+       │    (C) batch import ────────────┼───┐  one-time CLI load, §2.7
+       │        (offline, not an agent   │   │  vendor export → CanonicalSpan
+       │         code path)              │   │  (LangSmith / Braintrust / Arize)
+       │                                 ▼   ▼
                               ┌──────────────────────┐
-                              │  OTLP/HTTP receiver  │  stateless
+                              │  OTLP/HTTP receiver  │  stateless   (A), (B) only
                               │  POST /v1/traces     │
                               └──────────┬───────────┘
                                          │
                                     normalize          OTLP protobuf/JSON
                                          │             → canonical span dict
+                                         │◀── (C) adapter output joins here,
+                                         │        already a CanonicalSpan list
                                          ▼
                                      validate          per-span required fields
                                          │
@@ -361,4 +458,5 @@ adopting Jev touches neither ingest nor the store.
 | Multi-region storage | One design partner | At enterprise deals |
 | Auth beyond a per-tenant token | Design partner only | Before customer two |
 | Retention and deletion policy | No data old enough to matter | With the PII work (§2.5) |
-| SDK (Python, TypeScript) | Specified against real OTLP gaps | Stage 1 exit, week 2+ |
+| SDK — building it now | Specified in §2.6 against real OTLP gaps; TypeScript specifically | Python: Stage 1 exit, week 2+. TypeScript: when a partner's stack needs it |
+| Batch import — per-vendor adapters | The harness (CLI, shared write path) is Stage-1-adjacent and specified in §2.7; each vendor's `parse_export` is not pre-built | Per design partner, on demand — "ask before building" |
