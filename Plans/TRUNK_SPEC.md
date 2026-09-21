@@ -486,18 +486,35 @@ classification flow.
 | none, model `gpt-4o` | `no-tools:gpt-4o` |
 | no LLM-call spans at all | `no-tools:unknown` |
 
-### 7.2 Why a tool signature and not something smarter
+### 7.2 Why a tool signature, and an honest gap with what `PLAN.md` asked for
 
 A tool signature is answerable from the episode alone, deterministic, and
 free — the same three properties §8.1 requires of the weak-tier filter, and
 exactly what made that filter buildable in Stage 1 rather than deferred. It
-is also a real, product-validated proxy, not an arbitrary one: `GTM Plan.md`
-§1.3 cites Moda's own "failure-family" framing as tool- and workflow-shaped,
-not semantic. It will not match a human's idea of "flow" perfectly — two
-tool-identical episodes can still serve different intents — but it is
-strictly more useful than `"unsegmented"`, and unlike a semantic judge, it
-does not need Stage 1 to guess at product-specific categories that §2.3
-already argues will be wrong at first anyway.
+will not match a human's idea of "flow" perfectly — two tool-identical
+episodes can still serve different intents — but it is strictly more useful
+than `"unsegmented"`, and unlike a semantic judge, it does not need Stage 1
+to guess at product-specific categories that §2.3 already argues will be
+wrong at first anyway.
+
+**What it is not:** `PLAN.md` §4's Stage 1 table says flow segmentation
+should follow "Moda's failure-family framing," and `GTM Plan.md` §1.3 names
+that framing precisely — six families: **tools, memory, workflow, prompt,
+model behavior, product logic.** Those are failure *types* ("why did this go
+wrong"), assigned by judgment, not a *workflow* label read off which tools
+were called. A tool signature is a different, simpler thing: it buckets by
+"what was this conversation doing," not "what kind of failure was this." It
+was not derived from Moda's taxonomy and does not implement it — classifying
+into those six families needs the same real judgment call §8.2 draws the
+line at for the weak-tier filter, so it is out of a *structural* default's
+reach for the same reason.
+
+This is worth stating plainly rather than letting the citation imply more
+than it delivers: the tool signature is a legitimate, useful Stage 1 default
+on its own merits (§7.1), but it is a placeholder for Moda's actual framing,
+not an implementation of it — the same honesty §8.3 owes `tau/build_sft.py`.
+A real failure-family classifier is exactly the kind of judgment §7.3 defers
+to L1.
 
 ### 7.3 What it deliberately does not do
 
@@ -507,6 +524,12 @@ already argues will be wrong at first anyway.
   this section's whole job was to make the *default* real, not to make the
   function unswappable: `segment()`'s signature does not change when L1
   drops in something smarter.
+- **No failure-family classification.** §7.2's gap, restated as scope: Moda's
+  six families (tools, memory, workflow, prompt, model behavior, product
+  logic) are not implemented here. Building that for real is judgment-driven
+  in the same way the weak-tier filter's semantic checks are (§8.2) — a
+  natural L1 candidate for `JEV.md`'s fixed-question-schema approach, over
+  this section's `flow` value or in place of it.
 - **No cross-tenant taxonomy.** Flow strings are per-tenant and
   self-describing (`tools:x,y`), never drawn from a fixed enum. A shared
   taxonomy across tenants, if ever wanted, is an L1/L2 product decision, not
@@ -514,10 +537,13 @@ already argues will be wrong at first anyway.
 
 ### 7.4 Provenance
 
-Not a port of anything — `PLAN.md` §4 names Moda's failure-family framing
-(`GTM Plan.md` §1.3) as the intended *shape*, not a source file, so there is
-nothing to reconcile against later the way §8.3 flags for `tau/build_sft.py`.
-This is this spec's own first implementation of that framing.
+Not a port of anything, and — per §7.2's correction — not an implementation
+of Moda's failure-family framing either, despite `PLAN.md` §4 naming that
+framing as flow segmentation's intended shape. There is no source file to
+reconcile against the way §8.3 flags for `tau/build_sft.py`; the gap here is
+conceptual, not a missing file, and §7.2 is where it is owned. This section
+is this spec's own structural placeholder, offered on its own merits until
+L1 builds the real thing.
 
 ---
 
@@ -681,5 +707,6 @@ know. Exact-match is the only default that makes no claim it can't support.
 | Weak-tier filter — cross-episode dedup | Needs a persisted content-hash registry; §8 is intentionally per-episode-only | If duplicate SFT candidates prove to be a real problem |
 | Weak-tier filter — semantic/Jev classifier | A real network call, non-deterministic; §8's default is the deterministic floor | When precision beyond structural checks is worth the latency and cost |
 | Replay harness — automated pass/fail judgment | "Better" differs by layer (L1/L2/L3); §9.4's comparator is intentionally trivial | When L1/L2/L3 define their own comparator |
+| Flow segmentation — Moda's failure-family taxonomy | §7.2's honest gap: `PLAN.md` names this framing explicitly, but classifying into it needs judgment a structural default cannot supply | When L1 builds a real failure-type classifier |
 | Flow segmentation — semantic/Jev clustering | §7's tool signature is structural; "which flow is this" as a human would judge it needs the same real judge call §8.2 defers | When semantic precision is worth the latency and cost |
 | Flow segmentation — cross-tenant taxonomy | Flow strings are per-tenant and self-describing (§7.3); no shared enum exists | If a shared taxonomy becomes an L1/L2 product need |
