@@ -33,11 +33,35 @@ Named explicitly so they don't leak into the build:
 - **No UI.** The trunk's consumers are downstream code and a CLI, not a
   dashboard.
 - **No training.** Stage 3.
-- **No flow segmentation or weak-tier filter implementation.** The trunk
-  provides the episode they run *over*, and the interface they plug into.
-  `PLAN.md` Stage 1 lists both; they are specified in §7 as interfaces with
-  deliberately trivial default implementations, so Stage 2 can replace them
-  without touching ingest.
+- **No flow segmentation implementation.** The trunk provides the episode it
+  runs *over*, and the interface it plugs into (§7). Flow segmentation is
+  "which failure family is this" — genuinely L1's own judgment, built when L1
+  is built, not guessable from ingest alone.
+
+**Revision, 2026-09-21:** `PLAN.md` §4 Stage 1 originally named seven
+components — ingest, episode store, PII redaction, flow segmentation,
+weak-tier filter, replay harness, integrity layer. The first cut of this spec
+deferred both flow segmentation *and* the weak-tier filter to L1 as trivial
+interfaces, reasoning that neither could be built correctly without seeing
+real product-specific traffic. That reasoning still holds for flow
+segmentation. It does not hold for the weak-tier filter or the replay
+harness, and treating them identically was a mistake worth naming rather
+than quietly fixing:
+
+- The weak-tier filter's questions ("is this structurally usable as a
+  training example," "did the model error out," "is the output empty") are
+  answerable from the episode alone, need no product-specific judgment, and
+  are exactly what §6's Stage 1 gate needs a *real* verdict to spot-check
+  against — "no-filter-configured" makes that gate vacuous.
+- The replay harness is not Stage 2 work at all. `PLAN.md` §1.1 lists it as
+  shared by all three layers, and §4 Stage 1 already names it as the trunk's
+  own gate. It was simply not built yet.
+
+Both are therefore now in scope for this same delivery, specified in §8 and
+§9. Nothing about ingest's own boundary changes: §1's one-sentence mission
+still holds for the *ingest* half of this plan. The weak-tier filter and
+replay harness are downstream consumers of the episode, same as L1/L2/L3
+would be — they are just no longer deferred to L1's build.
 
 ---
 
@@ -354,7 +378,10 @@ shape. No code is copied; the idioms are.
          ┌───────────────┼───────────────┐
          ▼               ▼               ▼
     flow segment    weak-tier filter    replay harness
-    (interface)     (interface)         (Stage 1 gate)
+    (interface,     (real, §8)          (real, §9)
+     L1 fills it)   the Stage 1         the spot-check's
+                     gate's verdict      subject, once a
+                                         candidate exists
 ```
 
 ---
@@ -425,31 +452,174 @@ that samples N episodes stratified by filter verdict and flow, renders each as
 readable text, and records a human verdict alongside the machine one — so the
 afternoon produces a measured agreement rate, not an impression.
 
-This is the trunk's own acceptance test, not a Stage 2 feature.
+This is the trunk's own acceptance test. Per §1.1's revision, "the filter" is
+now the real classifier in §9, not a stub — a spot-check against
+`"no-filter-configured"` would measure nothing, since every episode agrees
+with a verdict that never disagrees.
 
 ---
 
 ## 7. Interfaces left open
 
-Both are named in `PLAN.md` Stage 1 and both are properly Stage 2 work. The
-trunk defines the seam and ships a trivial default, so Stage 2 replaces an
-implementation rather than modifying the pipeline.
+Named in `PLAN.md` Stage 1 and properly L1's own work — see §1.1's revision
+for why this one stays deferred while the weak-tier filter and replay harness
+(§8, §9) do not. The trunk defines the seam and ships a trivial default, so
+L1 replaces an implementation rather than modifying the pipeline.
 
 **Flow segmentation** — `segment(episode) -> str`. Default returns
 `"unsegmented"`.
 
-**Weak-tier filter** — `classify(episode) -> Verdict{keep: bool, reason: str,
-confidence: float | None}`. Default keeps everything with reason
-`"no-filter-configured"`. Ported from `tau/build_sft.py` in Stage 2.
-
-`JEV.md` §"Where it can be used" proposes Jev for both: a fixed question schema
-over every episode with known answer sets, where calibrated probabilities would
-improve stratified adjudication sampling. Both run *after* materialization, so
-adopting Jev touches neither ingest nor the store.
+`JEV.md` §"Where it can be used" proposes Jev here: a fixed question schema
+over every episode with known answer sets ("which flow is this?"), where
+calibrated probabilities would improve stratified sampling once flows exist.
+It runs *after* materialization, so adopting Jev touches neither ingest nor
+the store — the same property §9 relies on for the weak-tier filter.
 
 ---
 
-## 8. Out of scope, deliberately
+## 8. The weak-tier filter
+
+`classify(episode) -> Verdict` (§7's old stub, now real). Purpose, stated
+precisely because the label invites overreach: this filter answers **"is
+this episode structurally usable as a training candidate,"** not **"was the
+agent's behavior good."** `GTM Plan.md` §5 places LLM-judge-level signal
+firmly in the **Weak** tier — "SFT filter only. Never an RL reward" — and this
+classifier sits at or below that tier: it is a deterministic, per-episode
+heuristic, not a judgment about outcome quality. Confusing the two is exactly
+the failure `PLAN.md` §4's gate exists to catch: "a filter keeping the wrong
+20% poisons the dataset silently with no error message."
+
+### 8.1 What it checks
+
+Four rules, applied in order, first match wins:
+
+| # | Rule | Verdict | Reason string |
+| --- | --- | --- | --- |
+| 1 | `episode.tier != REPLAYABLE` | drop | `not replayable: missing {missing_fields}` |
+| 2 | any LLM-call span's `status_code == "ERROR"` | drop | `terminal call status ERROR` |
+| 3 | the last LLM-call span's output message content is empty or whitespace | drop | `empty terminal output` |
+| 4 | `span_count > max_span_count_for_sft` (config, default 200) | drop | `episode too long for SFT ({n} > {max})` |
+| — | none of the above | keep | `passed structural checks` |
+
+Confidence is always `None`. These are deterministic structural checks, not
+a calibrated judgment — reporting a confidence would imply a precision this
+classifier does not have.
+
+**Why these four and not more.** Each is answerable from the episode's own
+content — no product knowledge, no comparison across episodes, no external
+call. That is what makes it buildable now instead of deferred to L1 with flow
+segmentation (§1.1's revision): "was this a good conversation" needs to know
+what the product is for; "did the model crash mid-response" does not.
+
+### 8.2 What it deliberately does not check
+
+- **Cross-episode deduplication.** Two episodes with near-identical content
+  both pass today. Catching that needs a persisted content-hash registry
+  queried during classification, which breaks the "no DB, no network"
+  property every other pure-logic module in this plan holds (§3's testing
+  convention). Left out, not forgotten — see §10.
+- **Semantic quality** ("did the user retry," "was this resolved" —
+  `JEV.md`'s own examples). Those need an actual judge, which is a real
+  network call with real latency and cost, and the spec's job is to draw
+  where the deterministic default stops, not to build the judge. A Jev
+  classifier is the natural drop-in behind the same `classify()` signature,
+  exactly as `JEV.md` proposes for flow segmentation. Because that call is
+  non-deterministic and network-bound, it is out of Stage 1's own unit-test
+  discipline the same way S3 and Postgres calls are — smoke-tested, not
+  unit-tested, if and when it is added.
+
+### 8.3 Provenance and the honest reading of `tau/build_sft.py`
+
+`PLAN.md` §4 says "port from `tau/build_sft.py`." That file is not in this
+repository, and this spec was not written from it — §8.1's rules were derived
+from what `PLAN.md`, `GTM Plan.md` and `JEV.md` say the filter is *for*, not
+from the original implementation. Treat §8.1 as a placeholder contract to
+reconcile against the real `tau/build_sft.py` the first time it is available,
+the same caution §2.7 applies to an assumed LangSmith export schema — not as
+a claim that this is what that file does.
+
+---
+
+## 9. The replay harness
+
+`PLAN.md` §4: "re-run a change against stored traces. Pays off 3×." `PLAN.md`
+§1.1 lists it as shared by L1 (whole gate), L2/L3 (offline eval) — this is
+not Stage 2 work being pulled forward, it is trunk-adjacent infrastructure
+that was simply unbuilt until now.
+
+### 9.1 What "replay" means, precisely
+
+Given one `replayable` episode and a **candidate** — a set of overrides to
+apply to one of its LLM-call spans (a different system prompt, tool set,
+model, or sampling parameters, or none at all) — reconstruct the exact
+production input from the episode (§5.3's replay-required fields exist
+precisely so this reconstruction is possible), apply the overrides, invoke a
+real model, and record the new output paired with the production output that
+was actually shown to the user.
+
+**What the harness does not do: decide whether the new output is better.**
+"Better" means something different to L1 (did the fix resolve the failure),
+L2 (does the new output look like what a human would have accepted), and L3
+(did it improve the verified downstream outcome) — `PLAN.md` §1's whole
+premise is that these three layers are different products built on the same
+episode. Baking one layer's notion of "better" into the trunk's harness would
+make it wrong for the other two. The harness produces the **paired output**;
+judging it is a seam (§9.4), the same pattern §7 already uses for flow
+segmentation.
+
+### 9.2 Shape
+
+- `ModelClient` protocol — `complete(model, messages, temperature, top_p,
+  tools) -> ModelResponse`. An abstraction over the actual provider call
+  (OpenAI-shaped, matching §2.6's SDK convention), so the harness is not
+  hard-wired to one vendor.
+- `ReplayOverrides` — optional replacements for one or more of `model`,
+  `system_prompt` (spliced into the reconstructed messages), `temperature`,
+  `top_p`, `tools`. Omitted fields mean "replay unchanged" — the harness's
+  baseline mode, useful on its own as a determinism check: does the same
+  input reliably produce a similar output at all, before anyone proposes a
+  change to compare against.
+- `build_replay_input(episode, overrides) -> ReplayInput` — pure
+  reconstruction logic: read the episode's LLM-call span content, apply
+  overrides, produce exactly what would be sent to the model. Pure, unit
+  testable, no network.
+- `replay_episode(episode, client, overrides=None) -> ReplayResult` — refuses
+  a non-`replayable` episode outright (there is nothing to reconstruct);
+  otherwise builds the input, calls the client, and returns
+  `{episode_hash, production_output, replay_output, overrides_applied,
+  latency_ms, error}`.
+- `replay_batch(tenant_id, client, overrides=None, flow=None, n=None) ->
+  ReplayBatchResult` — pulls up to `n` kept, replayable episodes (optionally
+  scoped to one flow, once flow segmentation exists), replays each, and
+  reports aggregate latency and error rate. This is the CLI-facing
+  orchestrator, same shape as the materializer (§2.3) and the spot-check CLI
+  (§6): a batch job a human runs and reads the output of, not a live
+  service.
+
+### 9.3 Where results go
+
+A JSON report, one line per episode, written next to the run (or to S3 under
+`replays/tenant=<t>/<run_id>.jsonl` when run against real infrastructure) —
+the same "batch job, human reads the output" posture as the spot-check CLI in
+§6. Not indexed in Postgres for Stage 1: nothing yet queries "which replay
+runs happened," and adding a schema for a query no consumer has asked for
+repeats the mistake §1.1's revision just corrected. Add it when L1 needs one.
+
+### 9.4 The comparator seam
+
+`interfaces/compare.py` — `compare(result: ReplayResult) ->
+ComparisonVerdict{same: bool, note: str}`. Default: an exact string
+comparison of `production_output` against `replay_output` — a smoke check
+("did anything change at all, did the call even complete cleanly"), not a
+correctness judgment. L1 plugs in a comparator that checks whether the
+intended failure is fixed; L2/L3 plug in their own offline eval. Same pattern
+as flow segmentation (§7) and the weak-tier filter (§8): the trunk defines
+the seam and ships an inert default, because "did this get better" is not
+one question with one answer across three products.
+
+---
+
+## 10. Out of scope, deliberately
 
 | Not building | Why | When |
 | --- | --- | --- |
@@ -460,3 +630,6 @@ adopting Jev touches neither ingest nor the store.
 | Retention and deletion policy | No data old enough to matter | With the PII work (§2.5) |
 | SDK — building it now | Specified in §2.6 against real OTLP gaps; TypeScript specifically | Python: Stage 1 exit, week 2+. TypeScript: when a partner's stack needs it |
 | Batch import — per-vendor adapters | The harness (CLI, shared write path) is Stage-1-adjacent and specified in §2.7; each vendor's `parse_export` is not pre-built | Per design partner, on demand — "ask before building" |
+| Weak-tier filter — cross-episode dedup | Needs a persisted content-hash registry; §8 is intentionally per-episode-only | If duplicate SFT candidates prove to be a real problem |
+| Weak-tier filter — semantic/Jev classifier | A real network call, non-deterministic; §8's default is the deterministic floor | When precision beyond structural checks is worth the latency and cost |
+| Replay harness — automated pass/fail judgment | "Better" differs by layer (L1/L2/L3); §9.4's comparator is intentionally trivial | When L1/L2/L3 define their own comparator |
