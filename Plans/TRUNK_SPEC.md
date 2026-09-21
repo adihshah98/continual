@@ -33,20 +33,15 @@ Named explicitly so they don't leak into the build:
 - **No UI.** The trunk's consumers are downstream code and a CLI, not a
   dashboard.
 - **No training.** Stage 3.
-- **No flow segmentation implementation.** The trunk provides the episode it
-  runs *over*, and the interface it plugs into (§7). Flow segmentation is
-  "which failure family is this" — genuinely L1's own judgment, built when L1
-  is built, not guessable from ingest alone.
 
 **Revision, 2026-09-21:** `PLAN.md` §4 Stage 1 originally named seven
 components — ingest, episode store, PII redaction, flow segmentation,
 weak-tier filter, replay harness, integrity layer. The first cut of this spec
-deferred both flow segmentation *and* the weak-tier filter to L1 as trivial
-interfaces, reasoning that neither could be built correctly without seeing
-real product-specific traffic. That reasoning still holds for flow
-segmentation. It does not hold for the weak-tier filter or the replay
-harness, and treating them identically was a mistake worth naming rather
-than quietly fixing:
+deferred flow segmentation *and* the weak-tier filter to L1 as trivial
+interfaces, and left the replay harness unbuilt, reasoning that none of the
+three could be built correctly without seeing real product-specific traffic.
+That reasoning turned out to only genuinely apply to *semantic* judgment, not
+to any of the three components as a whole:
 
 - The weak-tier filter's questions ("is this structurally usable as a
   training example," "did the model error out," "is the output empty") are
@@ -56,12 +51,20 @@ than quietly fixing:
 - The replay harness is not Stage 2 work at all. `PLAN.md` §1.1 lists it as
   shared by all three layers, and §4 Stage 1 already names it as the trunk's
   own gate. It was simply not built yet.
+- Flow segmentation's *semantic* form ("which failure family is this") does
+  need product knowledge. But a **structural** proxy — which tools an
+  episode's LLM calls had on offer — needs none, is deterministic, and is
+  answerable from the episode alone, the same bar the other two clear. §7
+  ships that proxy as flow segmentation's real Stage 1 default, not a stub.
 
-Both are therefore now in scope for this same delivery, specified in §8 and
-§9. Nothing about ingest's own boundary changes: §1's one-sentence mission
-still holds for the *ingest* half of this plan. The weak-tier filter and
-replay harness are downstream consumers of the episode, same as L1/L2/L3
-would be — they are just no longer deferred to L1's build.
+All three are therefore in scope for this same delivery, specified in §7,
+§8 and §9. Nothing about ingest's own boundary changes: §1's one-sentence
+mission still holds for the *ingest* half of this plan. All three are
+downstream consumers of the episode, same as L1/L2/L3 would be — they are
+just no longer deferred to L1's build. What genuinely remains L1's own work
+is *semantic* flow labeling (§7.3) replacing the structural default, and
+everything past that: failure clustering, root-cause attribution, and a
+proposed-fix loop closing through the replay harness this plan builds.
 
 ---
 
@@ -378,9 +381,9 @@ shape. No code is copied; the idioms are.
          ┌───────────────┼───────────────┐
          ▼               ▼               ▼
     flow segment    weak-tier filter    replay harness
-    (interface,     (real, §8)          (real, §9)
-     L1 fills it)   the Stage 1         the spot-check's
-                     gate's verdict      subject, once a
+    (real, §7)      (real, §8)          (real, §9)
+    tool-call        the Stage 1         the spot-check's
+    signature        gate's verdict      subject, once a
                                          candidate exists
 ```
 
@@ -452,28 +455,69 @@ that samples N episodes stratified by filter verdict and flow, renders each as
 readable text, and records a human verdict alongside the machine one — so the
 afternoon produces a measured agreement rate, not an impression.
 
-This is the trunk's own acceptance test. Per §1.1's revision, "the filter" is
-now the real classifier in §9, not a stub — a spot-check against
-`"no-filter-configured"` would measure nothing, since every episode agrees
-with a verdict that never disagrees.
+This is the trunk's own acceptance test. Per §1.1's revision, both axes of
+that stratification are now real: "filter verdict" is §8's classifier, not
+`"no-filter-configured"`, and "flow" is §7's tool-signature bucket, not
+`"unsegmented"`. Spot-checking against either stub would have measured
+nothing, since every episode would have agreed with a verdict that never
+disagrees.
 
 ---
 
-## 7. Interfaces left open
+## 7. The flow segmenter
 
-Named in `PLAN.md` Stage 1 and properly L1's own work — see §1.1's revision
-for why this one stays deferred while the weak-tier filter and replay harness
-(§8, §9) do not. The trunk defines the seam and ships a trivial default, so
-L1 replaces an implementation rather than modifying the pipeline.
+`segment(episode) -> str` (previously the plan's one true stub — always
+`"unsegmented"` — now a real, product-agnostic default, per §1.1's revision).
 
-**Flow segmentation** — `segment(episode) -> str`. Default returns
-`"unsegmented"`.
+### 7.1 What it computes
 
-`JEV.md` §"Where it can be used" proposes Jev here: a fixed question schema
-over every episode with known answer sets ("which flow is this?"), where
-calibrated probabilities would improve stratified sampling once flows exist.
-It runs *after* materialization, so adopting Jev touches neither ingest nor
-the store — the same property §9 relies on for the weak-tier filter.
+The **tool-call signature**: the sorted, deduplicated set of tool names
+offered across the episode's LLM-call spans (`gen_ai.request.tools`, §5.3),
+joined into one string. Two episodes offered the same tools, in whatever
+order, land in the same flow. An episode with no tools offered anywhere
+falls into `no-tools:<model>` — still a real bucket, not a catch-all: "which
+model, no tools" already separates, say, a pure-Q&A flow from a
+classification flow.
+
+| Episode's tools offered | `segment()` returns |
+| --- | --- |
+| `refund_lookup`, `refund_issue` | `tools:refund_issue,refund_lookup` |
+| same two tools, offered in the opposite order | `tools:refund_issue,refund_lookup` (identical — sorted) |
+| none, model `gpt-4o` | `no-tools:gpt-4o` |
+| no LLM-call spans at all | `no-tools:unknown` |
+
+### 7.2 Why a tool signature and not something smarter
+
+A tool signature is answerable from the episode alone, deterministic, and
+free — the same three properties §8.1 requires of the weak-tier filter, and
+exactly what made that filter buildable in Stage 1 rather than deferred. It
+is also a real, product-validated proxy, not an arbitrary one: `GTM Plan.md`
+§1.3 cites Moda's own "failure-family" framing as tool- and workflow-shaped,
+not semantic. It will not match a human's idea of "flow" perfectly — two
+tool-identical episodes can still serve different intents — but it is
+strictly more useful than `"unsegmented"`, and unlike a semantic judge, it
+does not need Stage 1 to guess at product-specific categories that §2.3
+already argues will be wrong at first anyway.
+
+### 7.3 What it deliberately does not do
+
+- **No semantic clustering.** Two tool-identical episodes with different
+  user intents land in the same flow today. `JEV.md`'s proposal — a fixed
+  question schema, "which flow is this?" — is the natural replacement, and
+  this section's whole job was to make the *default* real, not to make the
+  function unswappable: `segment()`'s signature does not change when L1
+  drops in something smarter.
+- **No cross-tenant taxonomy.** Flow strings are per-tenant and
+  self-describing (`tools:x,y`), never drawn from a fixed enum. A shared
+  taxonomy across tenants, if ever wanted, is an L1/L2 product decision, not
+  an ingest one.
+
+### 7.4 Provenance
+
+Not a port of anything — `PLAN.md` §4 names Moda's failure-family framing
+(`GTM Plan.md` §1.3) as the intended *shape*, not a source file, so there is
+nothing to reconcile against later the way §8.3 flags for `tau/build_sft.py`.
+This is this spec's own first implementation of that framing.
 
 ---
 
@@ -612,10 +656,14 @@ ComparisonVerdict{same: bool, note: str}`. Default: an exact string
 comparison of `production_output` against `replay_output` — a smoke check
 ("did anything change at all, did the call even complete cleanly"), not a
 correctness judgment. L1 plugs in a comparator that checks whether the
-intended failure is fixed; L2/L3 plug in their own offline eval. Same pattern
-as flow segmentation (§7) and the weak-tier filter (§8): the trunk defines
-the seam and ships an inert default, because "did this get better" is not
-one question with one answer across three products.
+intended failure is fixed; L2/L3 plug in their own offline eval.
+
+Same seam shape as flow segmentation (§7) and the weak-tier filter (§8), but
+this one's default stays genuinely inert where theirs became real
+(§1.1's revision): a tool signature and a structural check are both
+answerable from the episode alone, but "did this get better" is not — it
+depends on what L1, L2 and L3 each mean by better, which the trunk cannot
+know. Exact-match is the only default that makes no claim it can't support.
 
 ---
 
@@ -633,3 +681,5 @@ one question with one answer across three products.
 | Weak-tier filter — cross-episode dedup | Needs a persisted content-hash registry; §8 is intentionally per-episode-only | If duplicate SFT candidates prove to be a real problem |
 | Weak-tier filter — semantic/Jev classifier | A real network call, non-deterministic; §8's default is the deterministic floor | When precision beyond structural checks is worth the latency and cost |
 | Replay harness — automated pass/fail judgment | "Better" differs by layer (L1/L2/L3); §9.4's comparator is intentionally trivial | When L1/L2/L3 define their own comparator |
+| Flow segmentation — semantic/Jev clustering | §7's tool signature is structural; "which flow is this" as a human would judge it needs the same real judge call §8.2 defers | When semantic precision is worth the latency and cost |
+| Flow segmentation — cross-tenant taxonomy | Flow strings are per-tenant and self-describing (§7.3); no shared enum exists | If a shared taxonomy becomes an L1/L2 product need |
